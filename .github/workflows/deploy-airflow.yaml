@@ -1,0 +1,77 @@
+name: Deploy Airflow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy Airflow to Prod
+    runs-on: ubuntu-latest
+
+    environment: prod
+
+    env:
+      CLUSTER_NAME: mycluster-prod-aks
+      RESOURCE_GROUP: my-prod-apps-rg
+      NAMESPACE: airflow
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ env.CLUSTER_NAME }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4.3.0
+
+      - name: Validate Kustomize
+        run: |
+          kubectl kustomize airflow/prod
+
+      - name: Apply Kubernetes resources
+        run: |
+          kubectl apply -k airflow/prod
+
+      - name: Add Apache Airflow Helm repository
+        run: |
+          helm repo add apache-airflow https://airflow.apache.org
+          helm repo update
+
+      - name: Check Airflow Helm chart
+        run: |
+          helm search repo apache-airflow/airflow
+
+      - name: Render Airflow Helm chart
+        run: |
+          helm template airflow apache-airflow/airflow \
+            --namespace "${NAMESPACE}" \
+            --values airflow/prod/values.yaml \
+            > /tmp/airflow-rendered.yaml
+
+      - name: Deploy Airflow
+        run: |
+          helm upgrade --install airflow apache-airflow/airflow \
+            --namespace "${NAMESPACE}" \
+            --values airflow/prod/values.yaml \
+            --wait \
+            --timeout 18m
+
+      - name: Verify Airflow deployment
+        run: |
+          kubectl get pods -n "${NAMESPACE}"
+          kubectl get svc -n "${NAMESPACE}"
+          kubectl get ingress -n "${NAMESPACE}"
+          kubectl get serviceaccount -n "${NAMESPACE}"
+          kubectl get secretproviderclass -n "${NAMESPACE}"
