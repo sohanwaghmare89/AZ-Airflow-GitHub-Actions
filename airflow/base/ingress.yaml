@@ -1,1 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
 
+metadata:
+  name: airflow
+  namespace: airflow
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+
+spec:
+  ingressClassName: nginx-internal
+
+  tls:
+    - hosts:
+        - airflow.mydomain.com
+      secretName: aurainsuredotai-tls
+
+  rules:
+    - host: airflow.mydomain.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: airflow-api-server
+                port:
+                  number: 8080
