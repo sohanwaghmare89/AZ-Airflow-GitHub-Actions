@@ -13,7 +13,7 @@ spec:
   tls:
     - hosts:
         - airflow.mydomain.com
-      secretName: aurainsuredotai-tls
+      secretName: mydomaindotcom-tls
 
   rules:
     - host: airflow.mydomain.com
