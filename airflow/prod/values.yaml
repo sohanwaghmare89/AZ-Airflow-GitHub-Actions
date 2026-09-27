@@ -1,1 +1,403 @@
+# ============================================================
+# Apache Airflow PROD
+# AKS: my-prod-aks
+# Namespace: airflow
+# Helm Chart: apache-airflow/airflow
+# ============================================================
 
+airflowVersion: "3.2.2"
+
+labels:
+  azure.workload.identity/use: "true"
+
+# Install required Python dependencies for custom SSO security manager
+extraPipPackages:
+  - "pyjwt"
+
+# ============================================================
+# Environment variables
+# ============================================================
+
+extraEnv: |
+  - name: AZURE_TENANT_ID
+    valueFrom:
+      secretKeyRef:
+        name: airflow-azure-sso
+        key: tenant-id
+
+  - name: AZURE_CLIENT_ID
+    valueFrom:
+      secretKeyRef:
+        name: airflow-azure-sso
+        key: client-id
+
+  - name: AZURE_CLIENT_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: airflow-azure-sso
+        key: client-secret
+        
+  - name: AIRFLOW_TEAMS_WEBHOOK_URL
+    valueFrom:
+      secretKeyRef:
+        name: airflow-teams-webhook
+        key: webhook-url
+
+# ============================================================
+# Executor
+# ============================================================
+
+executor: KubernetesExecutor
+
+# ============================================================
+# PostgreSQL
+# ============================================================
+
+data:
+  metadataSecretName: airflow-db-connection
+
+postgresql:
+  enabled: false
+
+# ============================================================
+# Airflow configuration
+# ============================================================
+
+# config:
+#   core:
+#     load_examples: "False"
+
+# #new config for temporary
+# config:
+#   core:
+#     load_examples: "False"
+#   kubernetes_executor:
+#     delete_worker_pods_on_failure: "False"
+
+config:
+  core:
+    load_examples: "False"
+    execution_api_server_url: "http://airflow-api-server.airflow.svc.cluster.local:8080/execution/"
+  kubernetes_executor:
+    delete_worker_pods_on_failure: "False"
+
+# ============================================================
+# Airflow secrets
+# ============================================================
+
+fernetKeySecretName: airflow-fernet-key
+
+apiSecretKeySecretName: airflow-api-secret
+
+# ============================================================
+# DAGs
+# ============================================================
+
+dags:
+  gitSync:
+    enabled: true
+    repo: https://github.com/mydomain/my-airflow-dags.git
+    branch: airflow-az-aks
+    ref: airflow-az-aks
+    depth: 1
+    credentialsSecret: airflow-git-credentials
+    # Chart defaults subPath to "tests/dags"; our repo has DAGs at its root,
+    # so this must be cleared or the dag-processor scans a nonexistent folder.
+    subPath: ""
+
+# ============================================================
+# API Server
+# ============================================================
+
+apiServer:
+  replicas: 2
+
+  startupProbe:
+    timeoutSeconds: 20
+    periodSeconds: 10
+    failureThreshold: 30
+
+  apiServerConfig: |
+    import os
+    import jwt
+    from flask_appbuilder.security.manager import AUTH_OAUTH
+    from airflow.providers.fab.auth_manager.security_manager.override import FabAirflowSecurityManagerOverride
+
+    AUTH_TYPE = AUTH_OAUTH
+    AUTH_USER_REGISTRATION = True
+    AUTH_USER_REGISTRATION_ROLE = "Viewer"
+    AUTH_ROLES_SYNC_AT_LOGIN = True
+
+    AUTH_ROLES_MAPPING = {
+        "46c2b4da-96f3-4706-967a-e3b22bb8b7ad": ["Admin"],
+        "65092143-6ebe-4977-9f2c-0233c6f444a1": ["Op"],
+        "5bd7eaa6-fe6b-4fa7-ada7-e319128aefbe": ["Viewer"],
+    }
+
+    class CustomSecurityManager(FabAirflowSecurityManagerOverride):
+        def oauth_user_info(self, provider, response=None):
+            if provider == "azure":
+                id_token = response["id_token"]
+                decoded = jwt.decode(id_token, options={"verify_signature": False})
+                return {
+                    "email": decoded.get("email") or decoded.get("preferred_username") or decoded.get("upn"),
+                    "first_name": decoded.get("given_name", ""),
+                    "last_name": decoded.get("family_name", ""),
+                    "username": decoded.get("preferred_username") or decoded.get("upn"),
+                    "role_keys": decoded.get("groups", []),
+                }
+            return {}
+
+    SECURITY_MANAGER_CLASS = CustomSecurityManager
+
+    OAUTH_PROVIDERS = [
+        {
+            "name": "azure",
+            "token_key": "access_token",
+            "icon": "fa-windows",
+            "remote_app": {
+                "client_id": os.environ.get("AZURE_CLIENT_ID"),
+                "client_secret": os.environ.get("AZURE_CLIENT_SECRET"),
+                "server_metadata_url": "https://login.microsoftonline.com/{}/v2.0/.well-known/openid-configuration".format(
+                    os.environ.get("AZURE_TENANT_ID")
+                ),
+                "api_base_url": "https://graph.microsoft.com/",
+                "client_kwargs": {
+                    "scope": "openid email profile User.Read"
+                },
+            },
+        }
+    ]
+
+  serviceAccount:
+    create: false
+    name: airflow-sa
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  nodeSelector:
+    workload: infra
+
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: infra
+      effect: NoSchedule
+
+  extraVolumes:
+    - name: secrets-store-inline
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: my-secrets
+
+  extraVolumeMounts:
+    - name: secrets-store-inline
+      mountPath: /mnt/secrets-store
+      readOnly: true
+
+# ============================================================
+# Scheduler
+# ============================================================
+
+scheduler:
+  replicas: 2
+
+  serviceAccount:
+    create: false
+    name: airflow-sa
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  nodeSelector:
+    workload: infra
+
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: infra
+      effect: NoSchedule
+
+  extraVolumes:
+    - name: secrets-store-inline
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: my-secrets
+
+  extraVolumeMounts:
+    - name: secrets-store-inline
+      mountPath: /mnt/secrets-store
+      readOnly: true
+
+# ============================================================
+# DAG Processor
+# ============================================================
+
+dagProcessor:
+  enabled: true
+
+  # Scaled to 1 to avoid file-lock conflicts on single git repository mount
+  replicas: 1
+
+  # Default liveness probe ("airflow jobs check") was timing out at 20s and
+  # kubelet was killing the container every ~30s (600+ restarts observed).
+  # Widen timeout/threshold to give it real headroom.
+  livenessProbe:
+    timeoutSeconds: 30
+    periodSeconds: 15
+    failureThreshold: 10
+
+  serviceAccount:
+    create: false
+    name: airflow-sa
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  nodeSelector:
+    workload: infra
+
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: infra
+      effect: NoSchedule
+
+  extraVolumes:
+    - name: secrets-store-inline
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: my-secrets
+
+  extraVolumeMounts:
+    - name: secrets-store-inline
+      mountPath: /mnt/secrets-store
+      readOnly: true
+
+# ============================================================
+# Triggerer
+# ============================================================
+
+triggerer:
+  enabled: true
+
+  replicas: 1
+
+  serviceAccount:
+    create: false
+    name: airflow-sa
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  nodeSelector:
+    workload: infra
+
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: infra
+      effect: NoSchedule
+
+  extraVolumes:
+    - name: secrets-store-inline
+      csi:
+        driver: secrets-store.csi.k8s.io
+        readOnly: true
+        volumeAttributes:
+          secretProviderClass: my-secrets
+
+  extraVolumeMounts:
+    - name: secrets-store-inline
+      mountPath: /mnt/secrets-store
+      readOnly: true
+
+# ============================================================
+# Workers
+# ============================================================
+
+workers:
+  kubernetes:
+    serviceAccount:
+      create: false
+      name: airflow-sa
+
+    nodeSelector:
+      workload: infra
+
+    tolerations:
+      - key: dedicated
+        operator: Equal
+        value: infra
+        effect: NoSchedule
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+# ============================================================
+# Disable Celery
+# ============================================================
+
+redis:
+  enabled: false
+
+flower:
+  enabled: false
+
+# ============================================================
+# Logs
+# ============================================================
+
+logs:
+  persistence:
+    enabled: false
+
+# ============================================================
+# Default node placement
+# ============================================================
+
+nodeSelector:
+  workload: infra
+
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: infra
+    effect: NoSchedule
